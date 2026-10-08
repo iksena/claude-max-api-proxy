@@ -135,6 +135,15 @@ export function cliErrorFromResult(result: ClaudeCliResult): {
   status: number;
   body: { error: { message: string; type: string; code: string | null } };
 } | null {
+  // Claude Max usage caps arrive as plain text (e.g. "You've hit your session limit · resets 3:10am"),
+  // and the CLI does not always set is_error for them. Never pass that text on as model output.
+  const text = String(result.result ?? "");
+  if (/^\s*(You've|You have) (hit|reached) your (session|usage|weekly|daily|5-hour|opus)[^\n]{0,40}limit/i.test(text)) {
+    return {
+      status: 429,
+      body: { error: { message: text, type: "usage_limit", code: "rate_limit_exceeded" } },
+    };
+  }
   if (!result.is_error) return null;
   const refusal = result.stop_reason === "refusal";
   return {
