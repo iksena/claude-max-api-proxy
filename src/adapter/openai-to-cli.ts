@@ -6,6 +6,9 @@ import type { OpenAIChatRequest, OpenAIContentBlock } from "../types/openai.js";
 
 export type ClaudeModel = "opus" | "sonnet" | "haiku";
 
+// Mirrors TOOLS_ALLOWED in subprocess/manager.ts (kept local to avoid a cycle).
+const LOCKED = process.env.CLAUDE_PROXY_ALLOW_TOOLS !== "1";
+
 export interface CliInput {
   prompt: string;
   model: ClaudeModel;
@@ -22,6 +25,8 @@ const MODEL_MAP: Record<string, ClaudeModel> = {
   "claude-sonnet-4-6": "sonnet",
   "claude-sonnet-5": "sonnet",
   "claude-opus-5": "opus",
+  "claude-opus-5-5": "opus",
+  "claude-sonnet-5-5": "sonnet",
   "claude-haiku-4": "haiku",
   "claude-haiku-4-5": "haiku",
   // Bare aliases
@@ -41,13 +46,18 @@ export function extractModel(model: string): ClaudeModel {
     return MODEL_MAP[model];
   }
 
-  // Try stripping provider prefix
-  const stripped = model.replace(/^(?:claude-code-cli|claude-max)\//, "");
+  // Try stripping provider prefix; accept dots as well as dashes
+  // (e.g. "claude-opus-5.5" == "claude-opus-5-5")
+  const stripped = model
+    .replace(/^(?:claude-code-cli|claude-max)\//, "")
+    .toLowerCase()
+    .replace(/\./g, "-");
   if (MODEL_MAP[stripped]) {
     return MODEL_MAP[stripped];
   }
 
-  // Default to opus (Claude Max subscription)
+  // Default to opus (Claude Max subscription), but never silently.
+  console.warn(`[extractModel] unknown model "${model}", defaulting to "opus"`);
   return "opus";
 }
 
@@ -116,7 +126,8 @@ export function messagesToPrompt(
       case "system":
         // System messages become context instructions
         // Strip OpenClaw tooling sections that conflict with Claude Code's native tools
-        parts.push(`<system>\n${stripOpenClawTooling(text)}\n</system>\n`);
+        // Locked mode passes prompts through verbatim (no section stripping).
+        parts.push(`<system>\n${LOCKED ? text : stripOpenClawTooling(text)}\n</system>\n`);
         break;
 
       case "user":

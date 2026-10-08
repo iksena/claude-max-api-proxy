@@ -8,7 +8,8 @@
 import { spawn, spawnSync, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
 import fs from "fs/promises";
-import { readFileSync } from "fs";
+import { readFileSync, mkdtempSync, rmSync, appendFileSync } from "fs";
+import os from "os";
 import path from "path";
 import type {
   ClaudeCliMessage,
@@ -24,6 +25,7 @@ import {
   isToolUseBlockStart,
   isInputJsonDelta,
   isContentBlockStop,
+  isSystemInit,
 } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 
@@ -46,6 +48,26 @@ export interface SubprocessEvents {
 }
 
 const DEFAULT_TIMEOUT = 900000; // 15 minutes
+
+/**
+ * Locked-down (text-only) mode is the DEFAULT in this fork.
+ *
+ * Upstream runs the Claude Code CLI with --dangerously-skip-permissions and every
+ * built-in tool (Bash, Read, Write, Grep, WebFetch, ...) plus whatever MCP
+ * connectors the account has, and tells the model to use them. When this proxy
+ * is used as an LLM backend for a benchmark, that lets the model read the host
+ * filesystem, run commands and browse the web, i.e. it can see ground truth,
+ * other jobs, and run extra validators. Locked mode makes the proxy a plain
+ * text-completion endpoint: no tools, no MCP, no settings/hooks, no skills, no
+ * session persistence, an empty throw-away working directory, prompts passed
+ * through verbatim, and fail-closed verification of the CLI's init event.
+ *
+ * Set CLAUDE_PROXY_ALLOW_TOOLS=1 to restore the upstream behaviour.
+ */
+export const TOOLS_ALLOWED = process.env.CLAUDE_PROXY_ALLOW_TOOLS === "1";
+
+/** Optional JSONL audit log: one line per completed request. */
+const AUDIT_LOG = process.env.CLAUDE_PROXY_AUDIT_LOG;
 
 /**
  * System prompt appended to Claude CLI to map OpenClaw tool names to Claude Code equivalents.
@@ -196,6 +218,9 @@ export class ClaudeSubprocess extends EventEmitter {
   private buffer: string = "";
   private timeoutId: NodeJS.Timeout | null = null;
   private isKilled: boolean = false;
+  private tmpCwd: string | null = null;
+  private sawTools: boolean = false;
+  private lastInit: { tools: unknown[]; mcp: unknown[] } | null = null;
 
   /**
    * Start the Claude CLI subprocess with the given prompt
@@ -203,6 +228,11 @@ export class ClaudeSubprocess extends EventEmitter {
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
     const args = this.buildArgs(options);
     const timeout = options.timeout || DEFAULT_TIMEOUT;
+    // Locked mode: run in a fresh empty directory so even a misconfigured CLI
+    // would have nothing to read.
+    if (!TOOLS_ALLOWED) {
+      this.tmpCwd = mkdtempSync(path.join(os.tmpdir(), "claude-proxy-"));
+    }
     if (process.env.DEBUG_SUBPROCESS) {
       console.error(`[Subprocess] args: ${JSON.stringify(args)}`);
       console.error(`[Subprocess] prompt: ${prompt.slice(0, 200)}`);
@@ -213,7 +243,7 @@ export class ClaudeSubprocess extends EventEmitter {
         // Use spawn() for security - no shell interpretation
         const { bin, shell } = resolveClaudeBin();
         this.process = spawn(bin, args, {
-          cwd: options.cwd || process.cwd(),
+          cwd: this.tmpCwd || options.cwd || process.cwd(),
           env: Object.fromEntries(
             Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
           ),
@@ -277,6 +307,10 @@ export class ClaudeSubprocess extends EventEmitter {
           if (this.buffer.trim()) {
             this.processBuffer();
           }
+          if (this.tmpCwd) {
+            try { rmSync(this.tmpCwd, { recursive: true, force: true }); } catch { /* ignore */ }
+            this.tmpCwd = null;
+          }
           this.emit("close", code);
         });
 
@@ -293,6 +327,29 @@ export class ClaudeSubprocess extends EventEmitter {
    * Build CLI arguments array
    */
   private buildArgs(options: SubprocessOptions): string[] {
+    if (!TOOLS_ALLOWED) {
+      // Locked, text-only mode (default). See TOOLS_ALLOWED above.
+      return [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--model",
+        options.model,
+        "--tools",
+        "", // no built-in tools at all
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}', // ignore every MCP server / claude.ai connector
+        "--setting-sources",
+        "", // ignore user/project/local settings, hooks, CLAUDE.md
+        "--disable-slash-commands", // no skills
+        "--no-session-persistence", // never resume or leak context between requests
+        // Prompt is passed via stdin (avoids E2BIG on large inputs)
+      ];
+    }
+
     const args = [
       "--print", // Non-interactive mode
       "--dangerously-skip-permissions", // Skip permission prompts
@@ -323,6 +380,42 @@ export class ClaudeSubprocess extends EventEmitter {
     return args;
   }
 
+  /** Kill the CLI and report a policy violation (locked mode only). */
+  private failClosed(reason: string): void {
+    if (this.isKilled) return;
+    if (this.process) {
+      this.isKilled = killProcessTree(this.process, "SIGKILL");
+    }
+    this.emit("error", new Error(`[locked mode] ${reason}`));
+  }
+
+  /** Append one audit record per finished request (CLAUDE_PROXY_AUDIT_LOG). */
+  private audit(result: ClaudeCliResult): void {
+    if (!AUDIT_LOG) return;
+    try {
+      const usage = result.modelUsage || {};
+      appendFileSync(
+        AUDIT_LOG,
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          locked: !TOOLS_ALLOWED,
+          num_turns: result.num_turns,
+          tools_at_init: this.lastInit ? this.lastInit.tools : null,
+          mcp_at_init: this.lastInit ? this.lastInit.mcp : null,
+          tool_use_seen: this.sawTools,
+          model_usage: Object.fromEntries(
+            Object.entries(usage).map(([k, v]) => [
+              k,
+              { in: (v as any).inputTokens, out: (v as any).outputTokens },
+            ])
+          ),
+        }) + "\n"
+      );
+    } catch {
+      /* auditing must never break a request */
+    }
+  }
+
   /**
    * Process the buffer and emit parsed messages
    */
@@ -336,6 +429,30 @@ export class ClaudeSubprocess extends EventEmitter {
 
       try {
         const message: ClaudeCliMessage = JSON.parse(trimmed);
+
+        if (isSystemInit(message)) {
+          this.lastInit = {
+            tools: message.tools || [],
+            mcp: message.mcp_servers || [],
+          };
+          if (!TOOLS_ALLOWED && (this.lastInit.tools.length > 0 || this.lastInit.mcp.length > 0)) {
+            this.failClosed(
+              `CLI exposed tools=${JSON.stringify(this.lastInit.tools)} mcp=${JSON.stringify(this.lastInit.mcp)}`
+            );
+            return;
+          }
+        }
+        if (isToolUseBlockStart(message)) {
+          this.sawTools = true;
+          if (!TOOLS_ALLOWED) {
+            this.failClosed("model attempted a tool call");
+            return;
+          }
+        }
+        if (isResultMessage(message)) {
+          this.audit(message);
+        }
+
         this.emit("message", message);
 
         if (isTextBlockStart(message)) {

@@ -261,3 +261,31 @@ MIT
 - Originally created by [atalovesyou](https://github.com/atalovesyou/claude-max-api-proxy)
 - Built for use with [OpenClaw](https://openclaw.com)
 - Powered by [Claude Code CLI](https://github.com/anthropics/claude-code)
+
+## Locked-down mode for benchmarks (this fork)
+
+Upstream runs the Claude Code CLI with `--dangerously-skip-permissions`, every built-in tool
+(Bash, Read, Write, Grep, WebFetch, ...), the account's MCP connectors, and a system prompt telling the model to
+use them. If you use the proxy as an LLM backend for an evaluation, the model can read the host filesystem,
+run commands, browse the web and see other jobs. **This fork is text-only by default:**
+
+| Setting | Default (locked) | `CLAUDE_PROXY_ALLOW_TOOLS=1` (upstream behaviour) |
+|---|---|---|
+| Built-in tools | none (`--tools ""`) | all |
+| MCP servers / connectors | none (`--strict-mcp-config`, empty config) | account defaults |
+| Settings, hooks, CLAUDE.md, skills | ignored | loaded |
+| Permissions | not needed | skipped |
+| Sessions | never persisted or resumed | resumed per `user` |
+| Working directory | fresh empty temp dir per request | proxy cwd |
+| Prompts | passed through verbatim | OpenClaw sections stripped |
+| Fail-closed check | request fails if init reports any tool/MCP server or the model attempts a tool call | - |
+
+Other changes:
+- The reported `model` is the exact model id of the CLI's `modelUsage` entry with the most output tokens
+  (e.g. `claude-opus-5-5`), not the first key and not a coarse family label. Streaming chunks carry it from the
+  first token. Set `CLAUDE_PROXY_FAMILY_LABELS=1` for the old `claude-opus-4` style labels.
+- Model aliases accept dots (`claude-opus-5.5`) and `claude-opus-5-5` / `claude-sonnet-5-5`; unknown names still
+  default to `opus` but now log a warning.
+- `CLAUDE_PROXY_AUDIT_LOG=/path/audit.jsonl` appends one JSON line per request: `num_turns`, tools/MCP servers
+  visible at init, whether a tool call was seen, and per-model token usage. In locked mode every line must show
+  `num_turns: 1` and empty `tools_at_init`.

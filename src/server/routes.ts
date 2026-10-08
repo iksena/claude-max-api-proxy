@@ -6,15 +6,17 @@
 
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { ClaudeSubprocess } from "../subprocess/manager.js";
+import { ClaudeSubprocess, TOOLS_ALLOWED } from "../subprocess/manager.js";
 import { openaiToCli, openaiToCliDelta } from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
+  normalizeModelName,
 } from "../adapter/cli-to-openai.js";
 import { getSession, setSession, clearSession } from "../subprocess/session-store.js";
 import type { OpenAIChatRequest, OpenAIToolCall } from "../types/openai.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
+import { isSystemInit } from "../types/claude-cli.js";
 
 interface SessionContext {
   sessionKey: string | undefined;
@@ -36,6 +38,10 @@ function resolveCliInput(body: OpenAIChatRequest): {
   // we have no way to distinguish callers, so skip resume entirely rather
   // than fall back to a shared key that would cross-contaminate unrelated
   // conversations.
+  // Locked mode never resumes: every request is stateless and self-contained.
+  if (!TOOLS_ALLOWED) {
+    return { cliInput: openaiToCli(body), sessionKey: undefined, resume: false };
+  }
   const sessionKey = body.user;
   const existing = sessionKey ? getSession(sessionKey) : undefined;
 
@@ -165,7 +171,7 @@ async function handleStreamingResponse(
           id: `chatcmpl-${requestId}`,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
-          model: lastModel,
+          model: normalizeModelName(lastModel),
           choices: [{
             index: 0,
             delta: {
@@ -187,7 +193,7 @@ async function handleStreamingResponse(
           id: `chatcmpl-${requestId}`,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
-          model: lastModel,
+          model: normalizeModelName(lastModel),
           choices: [{
             index: 0,
             delta: {
@@ -273,6 +279,12 @@ async function handleStreamingResponse(
     //     inToolBlock = false;
     //   }
     // });
+
+    // The init event arrives before any content delta and names the model,
+    // so streamed chunks are labelled correctly from the first token.
+    subprocess.on("message", (m) => {
+      if (isSystemInit(m) && m.model) lastModel = m.model;
+    });
 
     // Handle final assistant message (for model name)
     subprocess.on("assistant", (message: ClaudeCliAssistant) => {

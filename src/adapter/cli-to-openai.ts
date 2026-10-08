@@ -71,9 +71,13 @@ export function cliResultToOpenai(
   toolCalls?: OpenAIToolCall[]
 ): OpenAIChatResponse {
   // Get model from modelUsage or default
-  const modelName = result.modelUsage
-    ? Object.keys(result.modelUsage)[0]
-    : "claude-sonnet-4";
+  // The CLI may list auxiliary models (e.g. a Haiku helper call) in modelUsage.
+  // Report the model that produced the most output tokens, not the first key.
+  const usage = result.modelUsage ? Object.entries(result.modelUsage) : [];
+  usage.sort(
+    (a, b) => ((b[1] as any).outputTokens || 0) - ((a[1] as any).outputTokens || 0)
+  );
+  const modelName = usage.length ? usage[0][0] : "claude-sonnet-4";
 
   const message: OpenAIChatResponse["choices"][0]["message"] = {
     role: "assistant",
@@ -109,8 +113,13 @@ export function cliResultToOpenai(
  * Normalize Claude model names to a consistent format
  * e.g., "claude-sonnet-4-5-20250929" -> "claude-sonnet-4"
  */
-function normalizeModelName(model: string | undefined): string {
+export function normalizeModelName(model: string | undefined): string {
   if (!model) return "claude-sonnet-4";
+  // Default: report the exact model id (date suffix stripped), e.g. "claude-opus-5-5".
+  // Set CLAUDE_PROXY_FAMILY_LABELS=1 for the legacy coarse labels below.
+  if (process.env.CLAUDE_PROXY_FAMILY_LABELS !== "1") {
+    return model.replace(/-\d{8}$/, "");
+  }
   if (model.includes("opus")) return "claude-opus-4";
   if (model.includes("sonnet")) return "claude-sonnet-4";
   if (model.includes("haiku")) return "claude-haiku-4";
