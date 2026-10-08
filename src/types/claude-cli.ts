@@ -74,6 +74,8 @@ export interface ClaudeCliResult {
   type: "result";
   subtype: "success" | "error";
   is_error: boolean;
+  /** e.g. "refusal" when the model's safeguards declined the request */
+  stop_reason?: string | null;
   duration_ms: number;
   duration_api_ms: number;
   num_turns: number;

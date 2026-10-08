@@ -125,3 +125,26 @@ export function normalizeModelName(model: string | undefined): string {
   if (model.includes("haiku")) return "claude-haiku-4";
   return model;
 }
+
+/**
+ * A CLI result with is_error=true carries an error message in `result` (e.g. an API error or a
+ * safeguard refusal), NOT a completion. Never return it as assistant content: a benchmark would
+ * score the error text as the model's answer.
+ */
+export function cliErrorFromResult(result: ClaudeCliResult): {
+  status: number;
+  body: { error: { message: string; type: string; code: string | null } };
+} | null {
+  if (!result.is_error) return null;
+  const refusal = result.stop_reason === "refusal";
+  return {
+    status: refusal ? 422 : 502,
+    body: {
+      error: {
+        message: String(result.result ?? "Claude CLI reported an error"),
+        type: refusal ? "upstream_refusal" : "upstream_error",
+        code: result.stop_reason || result.subtype || null,
+      },
+    },
+  };
+}

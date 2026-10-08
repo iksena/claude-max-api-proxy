@@ -12,6 +12,7 @@ import {
   cliResultToOpenai,
   createDoneChunk,
   normalizeModelName,
+  cliErrorFromResult,
 } from "../adapter/cli-to-openai.js";
 import { getSession, setSession, clearSession } from "../subprocess/session-store.js";
 import type { OpenAIChatRequest, OpenAIToolCall } from "../types/openai.js";
@@ -296,7 +297,12 @@ async function handleStreamingResponse(
       if (sessionCtx.sessionKey && cliInput.sessionId) {
         setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
       }
-      if (!res.writableEnded) {
+      const cliErr = cliErrorFromResult(result);
+      if (cliErr && !res.writableEnded) {
+        console.error(`[Streaming] CLI error result (${cliErr.body.error.type}):`, cliErr.body.error.message.slice(0, 200));
+        res.write(`data: ${JSON.stringify(cliErr.body)}\n\n`);
+        res.end();
+      } else if (!res.writableEnded) {
         // Send final done chunk with finish_reason and usage data
         const doneChunk = createDoneChunk(requestId, lastModel);
         if (result.usage) {
@@ -418,7 +424,13 @@ async function handleNonStreamingResponse(
         if (sessionCtx.sessionKey && cliInput.sessionId) {
           setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
         }
-        res.json(cliResultToOpenai(finalResult, requestId));
+        const cliErr = cliErrorFromResult(finalResult);
+        if (cliErr) {
+          console.error(`[NonStreaming] CLI error result (${cliErr.body.error.type}):`, cliErr.body.error.message.slice(0, 200));
+          res.status(cliErr.status).json(cliErr.body);
+        } else {
+          res.json(cliResultToOpenai(finalResult, requestId));
+        }
       } else {
         if (sessionCtx.resume && sessionCtx.sessionKey) {
           clearSession(sessionCtx.sessionKey);
